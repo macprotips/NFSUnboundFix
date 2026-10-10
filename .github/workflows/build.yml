@@ -1,0 +1,108 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Pushing a tag like v1.0.0 also publishes a GitHub Release with the notarized app.
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    env:
+      TEAM_ID: MD83L42DNL
+      # Signing and notarizing switch on once these repository secrets exist. Without them the
+      # app is signed ad hoc and macOS asks the user to approve it on first launch.
+      HAS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: swift test
+
+      - name: Import Developer ID certificate
+        if: env.HAS_CERTIFICATE == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" | grep "($TEAM_ID)" | head -1 | awk '{print $2}')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No Developer ID Application certificate for team $TEAM_ID in MACOS_CERTIFICATE"
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          UNIVERSAL=1 BUILD_NUMBER=${{ github.run_number }} scripts/build-app.sh
+
+      - name: Notarize
+        if: env.HAS_CERTIFICATE == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit build/NFSUnboundFix.zip --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" --team-id "$TEAM_ID" --wait --output-format json \
+            | tee "$RUNNER_TEMP/notary.json"
+          STATUS="$(plutil -extract status raw "$RUNNER_TEMP/notary.json")"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            xcrun notarytool log "$(plutil -extract id raw "$RUNNER_TEMP/notary.json")" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$TEAM_ID"
+            echo "::error::Notarization finished with status $STATUS"
+            exit 1
+          fi
+          # Attach the ticket to the app so it opens even offline, then re-zip it.
+          xcrun stapler staple "build/NFS Unbound Fix.app"
+          rm build/NFSUnboundFix.zip
+          ditto -c -k --keepParent "build/NFS Unbound Fix.app" build/NFSUnboundFix.zip
+          spctl --assess --type execute --verbose=2 "build/NFS Unbound Fix.app"
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists, leaving it as it is."
+            exit 0
+          fi
+          if [[ "$HAS_CERTIFICATE" != "true" || "$HAS_NOTARY" != "true" ]]; then
+            echo "::warning::Not publishing $GITHUB_REF_NAME: releases are only published notarized, and the signing secrets aren't set."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          Download **NFSUnboundFix.zip** below, unzip it and drag **NFS Unbound Fix** into Applications.
+
+          Fixes the startup black screen in Need for Speed Unbound (Steam build 16690907) in CrossOver with D3DMetal. See the [README](https://github.com/macprotips/NFSUnboundFix#readme) for how to use it.
+
+          Signed and notarized by Apple. Requires macOS 13 or later.
+          NOTES
+          sed -i '' 's/^          //' "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" build/NFSUnboundFix.zip \
+            --title "NFS Unbound Fix ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NFS Unbound Fix
+          path: build/NFSUnboundFix.zip
+      - name: Remove signing keychain
+        if: always() && env.HAS_CERTIFICATE == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
