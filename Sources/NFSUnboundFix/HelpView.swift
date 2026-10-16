@@ -12,7 +12,9 @@ struct HelpView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     section("What does it do?",
-                            "It fixes the black screen at startup in Need for Speed Unbound when you play it in CrossOver with D3DMetal. It changes 7 bytes in one game file, Engine.Render.Core2.PlatformPcDx12.dll, to switch off an optional graphics cache involved in the crash.")
+                            "It fixes the black screen at startup in Need for Speed Unbound when you play it in CrossOver with D3DMetal. At startup the game pre-builds the shaders it saved last time, and a few of them can't be created on a Mac, which crashed the game. The fix makes the game skip just those and carry on, so it starts and keeps pre-building everything else, for less stutter. It changes a few bytes in one game file, Engine.Render.Core2.PlatformPcDx12.dll.")
+                    section("I used the original fix. Should I update?",
+                            "Yes. The original fix stopped the crash by turning shader pre-building off completely, which causes more stutter while you play. Drop your game folder in and click Update Fix. The first launch afterwards can take a little longer while shaders are built.")
                     section("Where's my game folder?",
                             "The game's folder is named Excalibur, not Need for Speed Unbound. It's inside your CrossOver bottle, usually ~/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Excalibur. You don't have to find it exactly: drop the whole bottle and the app finds the file.")
                     section("Is it safe?",

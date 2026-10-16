@@ -130,13 +130,14 @@ struct ContentView: View {
             } title: {
                 "Fix applied"
             } message: {
-                "Launch Unbound through Steam in CrossOver."
+                "Launch Unbound through Steam in CrossOver. The first launch can take a little longer while it pre-builds shaders."
             } details: {
                 Checklist(items: [
                     .init("Checked the game version"),
                     .init(report.reusedBackup ? "Original already backed up" : "Backed up the original",
                           detail: abbreviatedPath(report.backup)),
-                    .init("Changed 7 bytes in \(file.lastPathComponent)"),
+                    .init(report.replacedOlderFix ? "Replaced the old fix with the new one"
+                                                  : "Applied the fix to \(file.lastPathComponent)"),
                     .init("Checked the saved file"),
                 ])
             } buttons: {
@@ -145,7 +146,7 @@ struct ContentView: View {
                     .keyboardShortcut(.defaultAction)
             }
 
-        case .alreadyFixed(let file, let canUndo):
+        case .alreadyFixed(let file):
             StatusLayout {
                 StatusIcon(name: "checkmark.circle.fill", color: .green)
             } title: {
@@ -155,10 +156,26 @@ struct ContentView: View {
             } details: {
                 Checklist(items: [.init("Fix is applied", detail: abbreviatedPath(file))])
             } buttons: {
-                if canUndo {
-                    Button("Undo Fix") { model.undoFix(on: file) }
-                }
+                Button("Undo Fix") { model.undoFix(on: file) }
                 Button("Done") { model.startOver() }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+        case .olderFixFound(let file):
+            StatusLayout {
+                StatusIcon(name: "arrow.up.circle.fill", color: .accentColor)
+            } title: {
+                "Update available"
+            } message: {
+                "This game has the original fix, which turns shader pre-building off. The new fix keeps it on, for less stutter."
+            } details: {
+                Checklist(items: [
+                    .init("Found the game file", detail: abbreviatedPath(file)),
+                    .init("Has the original fix for Steam build 16690907"),
+                ])
+            } buttons: {
+                Button("Undo Fix") { model.undoFix(on: file) }
+                Button("Update Fix") { model.applyFix(to: file) }
                     .keyboardShortcut(.defaultAction)
             }
 

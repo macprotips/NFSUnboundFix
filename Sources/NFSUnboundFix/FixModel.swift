@@ -9,7 +9,8 @@ final class FixModel: ObservableObject {
         case searching
         case working(String)
         case ready(file: URL)
-        case alreadyFixed(file: URL, canUndo: Bool)
+        case alreadyFixed(file: URL)
+        case olderFixFound(file: URL)
         case fixed(file: URL, report: ApplyReport)
         case undone(file: URL)
         case problem(title: String, message: String, detail: String?)
@@ -53,7 +54,9 @@ final class FixModel: ObservableObject {
             case .original:
                 return .ready(file: file)
             case .patched:
-                return .alreadyFixed(file: file, canUndo: patcher.existingBackup() != nil)
+                return .alreadyFixed(file: file)
+            case .olderFix:
+                return .olderFixFound(file: file)
             case .unsupported(let hash):
                 throw PatchError.unsupportedVersion(sha256: hash)
             }
@@ -161,7 +164,7 @@ final class FixModel: ObservableObject {
     private func remember(_ phase: Phase) {
         let file: URL
         switch phase {
-        case .ready(let f), .alreadyFixed(let f, _), .fixed(let f, _), .undone(let f): file = f
+        case .ready(let f), .alreadyFixed(let f), .olderFixFound(let f), .fixed(let f, _), .undone(let f): file = f
         default: return
         }
         recentFile = file

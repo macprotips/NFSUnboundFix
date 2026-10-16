@@ -7,11 +7,17 @@ final class PatcherTests: XCTestCase {
     private var gameFolder: URL!
     private var backups: URL!
 
-    private let offset = 1000
-    private let originalBytes: [UInt8] = [0x44, 0x38, 0xAB, 0xC0, 0x01, 0x00, 0x00]
-    private let replacementBytes: [UInt8] = [0x80, 0xA3, 0xC0, 0x01, 0x00, 0x00, 0x00]
+    // The stand-in fix makes two edits; the stand-in older fix makes one edit somewhere else.
+    private let edits = [
+        ByteEdit(offset: 1000, original: [0x44, 0x38, 0xAB, 0xC0, 0x01, 0x00, 0x00],
+                 replacement: [0x80, 0xA3, 0xC0, 0x01, 0x00, 0x00, 0x00]),
+        ByteEdit(offset: 3000, original: [0x00, 0x00, 0x00, 0x00], replacement: [0x48, 0x83, 0xBD, 0x04]),
+    ]
+    private let olderEdit = ByteEdit(offset: 2000, original: [0x10, 0x20, 0x30, 0x40, 0x50],
+                                     replacement: [0x90, 0x90, 0x90, 0x90, 0x90])
     private var originalData: Data!
     private var patchedData: Data!
+    private var olderFixData: Data!
     private var spec: PatchSpec!
 
     override func setUpWithError() throws {
@@ -21,21 +27,33 @@ final class PatcherTests: XCTestCase {
         try FileManager.default.createDirectory(at: gameFolder, withIntermediateDirectories: true)
 
         var bytes = (0 ..< 4096).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }
-        bytes.replaceSubrange(offset ..< offset + 7, with: originalBytes)
+        for edit in edits + [olderEdit] {
+            bytes.replaceSubrange(edit.offset ..< edit.offset + edit.original.count, with: edit.original)
+        }
         originalData = Data(bytes)
-        patchedData = originalData
-        patchedData.replaceSubrange(offset ..< offset + 7, with: replacementBytes)
-        spec = makeSpec(originalBytes: originalBytes)
+        patchedData = Self.applying(edits, to: originalData)
+        olderFixData = Self.applying([olderEdit], to: originalData)
+        spec = makeSpec(edits: edits)
+    }
+
+    private static func applying(_ edits: [ByteEdit], to data: Data) -> Data {
+        var result = data
+        for edit in edits {
+            result.replaceSubrange(edit.offset ..< edit.offset + edit.replacement.count, with: edit.replacement)
+        }
+        return result
     }
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func makeSpec(originalBytes: [UInt8]) -> PatchSpec {
-        PatchSpec(fileName: PatchSpec.unboundBlackScreen.fileName, offset: offset,
-                  originalBytes: originalBytes, replacementBytes: replacementBytes,
-                  originalSHA256: sha256Hex(of: originalData), patchedSHA256: sha256Hex(of: patchedData))
+    private func makeSpec(edits: [ByteEdit]) -> PatchSpec {
+        PatchSpec(fileName: PatchSpec.unboundBlackScreen.fileName,
+                  originalSHA256: sha256Hex(of: originalData), patchedSHA256: sha256Hex(of: patchedData),
+                  edits: edits,
+                  olderFixes: [OlderFix(name: "the original fix", sha256: sha256Hex(of: olderFixData),
+                                        edits: [olderEdit])])
     }
 
     private var patcher: Patcher { Patcher(spec: spec, backupDirectory: backups) }
@@ -50,12 +68,23 @@ final class PatcherTests: XCTestCase {
 
     func testRealSpecIsConsistent() {
         let real = PatchSpec.unboundBlackScreen
-        XCTAssertEqual(real.offset, 0x1AB423)
-        XCTAssertEqual(real.originalBytes.count, 7)
-        XCTAssertEqual(real.replacementBytes.count, 7)
+        XCTAssertEqual(real.edits.count, 6)
         XCTAssertEqual(real.originalSHA256.count, 64)
         XCTAssertEqual(real.patchedSHA256.count, 64)
         XCTAssertNotEqual(real.originalSHA256, real.patchedSHA256)
+        // Edits are in order, don't overlap, and each actually changes something.
+        for (a, b) in zip(real.edits, real.edits.dropFirst()) {
+            XCTAssertLessThanOrEqual(a.offset + a.original.count, b.offset)
+        }
+        for edit in real.edits { XCTAssertNotEqual(edit.original, edit.replacement) }
+        // The original fix is recognised, and touches bytes the new fix doesn't.
+        XCTAssertEqual(real.olderFixes.count, 1)
+        let older = real.olderFixes[0]
+        XCTAssertEqual(older.sha256, "9dc33b2edebca402c48c53f32cce474aafd5d640e5754275484deaced66134aa")
+        XCTAssertEqual(older.edits.map(\.offset), [0x1AB423])
+        for edit in real.edits {
+            XCTAssertFalse((edit.offset ..< edit.offset + edit.original.count).overlaps(0x1AB423 ..< 0x1AB42A))
+        }
     }
 
     func testFindsFileFromBottleOrGameFolderOrFileItself() throws {
@@ -193,7 +222,8 @@ final class PatcherTests: XCTestCase {
     }
 
     func testUnexpectedBytesAreRefused() throws {
-        spec = makeSpec(originalBytes: [1, 2, 3, 4, 5, 6, 7])
+        spec = makeSpec(edits: [ByteEdit(offset: 1000, original: [1, 2, 3, 4, 5, 6, 7],
+                                         replacement: edits[0].replacement), edits[1]])
         let dll = try writeDLL(originalData)
         XCTAssertThrowsError(try patcher.apply(to: dll)) { XCTAssertEqual($0 as? PatchError, .unexpectedBytes) }
         XCTAssertEqual(try Data(contentsOf: dll), originalData)
@@ -212,15 +242,48 @@ final class PatcherTests: XCTestCase {
         XCTAssertEqual(PatchError.unsupportedVersion(sha256: "abc").title, "Unsupported game version")
     }
 
-    func testUndoFindsBackupFromOlderVersionOfTheApp() throws {
+    func testBackupsFromOlderVersionsOfTheAppAreFoundButNotSearched() throws {
         let older = root.appendingPathComponent("Older Backups")
         try writeDLL(originalData, in: older.appendingPathComponent("2026-10-10 at 12.00.00"))
-        let dll = try writeDLL(patchedData)
+        try writeDLL(patchedData)
         let patcher = Patcher(spec: spec, backupDirectory: backups, olderBackupDirectories: [older])
-        try patcher.restore(dll)
-        XCTAssertEqual(try Data(contentsOf: dll), originalData)
+        XCTAssertNotNil(patcher.existingBackup())
         let found = try patcher.findTargets(in: root)
         XCTAssertEqual(found.count, 1, "older backups aren't treated as game files: \(found.map(\.path))")
+    }
+
+    func testOlderFixIsRecognised() throws {
+        let dll = try writeDLL(olderFixData)
+        XCTAssertEqual(try patcher.state(of: dll), .olderFix(name: "the original fix"))
+    }
+
+    func testUpdatingFromOlderFix() throws {
+        let dll = try writeDLL(olderFixData)
+        let report = try patcher.apply(to: dll)
+        XCTAssertTrue(report.replacedOlderFix)
+        XCTAssertEqual(try Data(contentsOf: dll), patchedData)
+        XCTAssertEqual(try patcher.state(of: dll), .patched)
+        // The backup is the untouched original, not the older fix.
+        XCTAssertEqual(try Data(contentsOf: report.backup), originalData)
+    }
+
+    func testUndoingOlderFix() throws {
+        let dll = try writeDLL(olderFixData)
+        try patcher.restore(dll)
+        XCTAssertEqual(try Data(contentsOf: dll), originalData)
+    }
+
+    func testOlderFixWithUnexpectedBytesIsRefused() throws {
+        // Right fingerprint can't have the wrong bytes, so simulate a spec whose older-fix description is wrong.
+        spec = PatchSpec(fileName: spec.fileName, originalSHA256: spec.originalSHA256, patchedSHA256: spec.patchedSHA256,
+                         edits: edits,
+                         olderFixes: [OlderFix(name: "x", sha256: sha256Hex(of: olderFixData),
+                                               edits: [ByteEdit(offset: 2000, original: olderEdit.original,
+                                                                replacement: [1, 1, 1, 1, 1])])])
+        let dll = try writeDLL(olderFixData)
+        XCTAssertThrowsError(try patcher.apply(to: dll)) { XCTAssertEqual($0 as? PatchError, .unexpectedBytes) }
+        XCTAssertThrowsError(try patcher.restore(dll)) { XCTAssertEqual($0 as? PatchError, .noBackup) }
+        XCTAssertEqual(try Data(contentsOf: dll), olderFixData)
     }
 
     func testUndoOnUnpatchedFileIsRefused() throws {
@@ -228,9 +291,10 @@ final class PatcherTests: XCTestCase {
         XCTAssertThrowsError(try patcher.restore(dll)) { XCTAssertEqual($0 as? PatchError, .notPatched) }
     }
 
-    func testUndoWithoutBackupIsRefused() throws {
+    func testUndoWorksWithoutBackup() throws {
         let dll = try writeDLL(patchedData)
-        XCTAssertThrowsError(try patcher.restore(dll)) { XCTAssertEqual($0 as? PatchError, .noBackup) }
-        XCTAssertEqual(try Data(contentsOf: dll), patchedData)
+        XCTAssertNil(patcher.existingBackup())
+        try patcher.restore(dll)
+        XCTAssertEqual(try Data(contentsOf: dll), originalData)
     }
 }

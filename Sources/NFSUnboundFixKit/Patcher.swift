@@ -1,42 +1,108 @@
 import CryptoKit
 import Foundation
 
-/// One exact byte patch for one exact version of one file.
+/// One change to the file: the bytes expected at `offset`, and what replaces them.
+public struct ByteEdit: Equatable, Sendable {
+    public let offset: Int
+    public let original: [UInt8]
+    public let replacement: [UInt8]
+
+    public init(offset: Int, original: [UInt8], replacement: [UInt8]) {
+        precondition(original.count == replacement.count, "an edit must not change the file's length")
+        self.offset = offset
+        self.original = original
+        self.replacement = replacement
+    }
+}
+
+/// An earlier fix for the same file, described as the edits that turn the original into it.
+/// The app recognises it, can upgrade it to the current fix, and can undo it.
+public struct OlderFix: Sendable {
+    public let name: String
+    public let sha256: String
+    public let edits: [ByteEdit]
+
+    public init(name: String, sha256: String, edits: [ByteEdit]) {
+        self.name = name
+        self.sha256 = sha256.lowercased()
+        self.edits = edits
+    }
+}
+
+/// An exact set of byte edits for one exact version of one file.
 public struct PatchSpec: Sendable {
     public let fileName: String
-    public let offset: Int
-    public let originalBytes: [UInt8]
-    public let replacementBytes: [UInt8]
     public let originalSHA256: String
     public let patchedSHA256: String
+    public let edits: [ByteEdit]
+    public let olderFixes: [OlderFix]
 
-    public init(fileName: String, offset: Int, originalBytes: [UInt8], replacementBytes: [UInt8],
-                originalSHA256: String, patchedSHA256: String) {
+    public init(fileName: String, originalSHA256: String, patchedSHA256: String,
+                edits: [ByteEdit], olderFixes: [OlderFix] = []) {
         self.fileName = fileName
-        self.offset = offset
-        self.originalBytes = originalBytes
-        self.replacementBytes = replacementBytes
         self.originalSHA256 = originalSHA256.lowercased()
         self.patchedSHA256 = patchedSHA256.lowercased()
+        self.edits = edits
+        self.olderFixes = olderFixes
     }
 
-    /// Turns off the optional graphics cache behind the startup black screen
-    /// in Need for Speed Unbound, Steam build 16690907, under CrossOver with D3DMetal.
+    /// Fixes the startup crash in Need for Speed Unbound (Steam build 16690907) under CrossOver with D3DMetal,
+    /// while keeping the game's shader pre-building on.
+    ///
+    /// At startup the game pre-builds every pipeline it saved last time. D3DMetal refuses to create one or more
+    /// of the saved root signatures; the game doesn't check, builds pipelines with an empty root signature, then
+    /// crashes releasing the empty entry. These edits make the pre-build skip pipelines whose root signature
+    /// failed (the game then builds them normally when first needed) and make the cleanup skip empty entries.
     public static let unboundBlackScreen = PatchSpec(
         fileName: "Engine.Render.Core2.PlatformPcDx12.dll",
-        offset: 0x1AB423,
-        originalBytes: [0x44, 0x38, 0xAB, 0xC0, 0x01, 0x00, 0x00],
-        replacementBytes: [0x80, 0xA3, 0xC0, 0x01, 0x00, 0x00, 0x00],
         originalSHA256: "ee3a654be58be406eda32aeadad99ad60894403e374a2d3b847a20008cd30c62",
-        patchedSHA256: "9dc33b2edebca402c48c53f32cce474aafd5d640e5754275484deaced66134aa"
+        patchedSHA256: "496deaa8f65df105528cfd85e68b3521b11809d208da1724d07fd46494ef4b1f",
+        edits: [
+                // Declare the spare bytes at the end of the code section as part of it
+                ByteEdit(offset: 0x258,
+                         original: [0x8E, 0xFD, 0x20, 0x00],
+                         replacement: [0x00, 0xFE, 0x20, 0x00]),
+                // Graphics pre-build: check the root signature first (call the check below)
+                ByteEdit(offset: 0x433F4,
+                         original: [0xE8, 0xF7, 0x9A, 0x18, 0x00],
+                         replacement: [0xE8, 0x97, 0xCD, 0x1C, 0x00]),
+                // Compute pre-build: check the root signature first (jump to the check below)
+                ByteEdit(offset: 0x437D9,
+                         original: [0x4D, 0x85, 0xFF, 0x74, 0x28],
+                         replacement: [0xE9, 0xD2, 0xC9, 0x1C, 0x00]),
+                // Pre-build cleanup: skip empty root signatures instead of crashing
+                ByteEdit(offset: 0x43AE0,
+                         original: [0x48, 0x8B, 0x4F, 0x08, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x10, 0x48, 0x8B, 0x47, 0x10, 0x48, 0x8B, 0xF8, 0x48, 0x85, 0xC0, 0x75, 0x17, 0x66, 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+                         replacement: [0x48, 0x8B, 0x4F, 0x08, 0xE3, 0x06, 0x48, 0x8B, 0x01, 0xFF, 0x50, 0x10, 0x48, 0x8B, 0x7F, 0x10, 0x48, 0x85, 0xFF, 0x75, 0x18, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),
+                // The graphics check: an empty root signature fails the build, so the game rebuilds that pipeline normally later
+                ByteEdit(offset: 0x210190,
+                         original: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                         replacement: [0x48, 0x83, 0xBD, 0x00, 0x04, 0x00, 0x00, 0x00, 0x75, 0x03, 0x31, 0xC0, 0xC3, 0xE9, 0x4E, 0xCD, 0xFB, 0xFF]),
+                // The compute check: same, for compute pipelines
+                ByteEdit(offset: 0x2101B0,
+                         original: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                         replacement: [0x48, 0x83, 0xBD, 0x68, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x84, 0x3D, 0x37, 0xE3, 0xFF, 0x4D, 0x85, 0xFF, 0x0F, 0x84, 0x3F, 0x36, 0xE3, 0xFF, 0xE9, 0x12, 0x36, 0xE3, 0xFF]),
+        ],
+        olderFixes: [
+            // Version 1.0 of this app, and the original manual fix: switches shader pre-building off entirely.
+            OlderFix(
+                name: "the original fix",
+                sha256: "9dc33b2edebca402c48c53f32cce474aafd5d640e5754275484deaced66134aa",
+                edits: [ByteEdit(offset: 0x1AB423,
+                                 original: [0x44, 0x38, 0xAB, 0xC0, 0x01, 0x00, 0x00],
+                                 replacement: [0x80, 0xA3, 0xC0, 0x01, 0x00, 0x00, 0x00])]
+            ),
+        ]
     )
 }
 
 public enum FileState: Equatable, Sendable {
     /// The exact file the fix was made for. Safe to patch.
     case original
-    /// The fix is already applied.
+    /// The current fix is already applied.
     case patched
+    /// An older fix is applied. It can be upgraded or undone.
+    case olderFix(name: String)
     /// Some other version. Never touched.
     case unsupported(sha256: String)
 }
@@ -46,10 +112,13 @@ public struct ApplyReport: Equatable, Sendable {
     public let backup: URL
     /// True when a verified backup from an earlier run was reused instead of making a new one.
     public let reusedBackup: Bool
+    /// True when an older fix was replaced by the current one.
+    public let replacedOlderFix: Bool
 
-    public init(backup: URL, reusedBackup: Bool) {
+    public init(backup: URL, reusedBackup: Bool, replacedOlderFix: Bool = false) {
         self.backup = backup
         self.reusedBackup = reusedBackup
+        self.replacedOlderFix = replacedOlderFix
     }
 }
 
@@ -249,8 +318,42 @@ public struct Patcher: Sendable {
         switch hash {
         case spec.originalSHA256: return .original
         case spec.patchedSHA256: return .patched
-        default: return .unsupported(sha256: hash)
+        default:
+            if let older = spec.olderFixes.first(where: { $0.sha256 == hash }) { return .olderFix(name: older.name) }
+            return .unsupported(sha256: hash)
         }
+    }
+
+    /// The untouched original, worked out from the original itself, the current fix or an older fix,
+    /// by putting each edited byte back. Returns nil unless the result is exactly the original.
+    private func originalContents(of data: Data) -> Data? {
+        let hash = sha256Hex(of: data)
+        let edits: [ByteEdit]
+        if hash == spec.originalSHA256 {
+            return data
+        } else if hash == spec.patchedSHA256 {
+            edits = spec.edits
+        } else if let older = spec.olderFixes.first(where: { $0.sha256 == hash }) {
+            edits = older.edits
+        } else {
+            return nil
+        }
+        guard let restored = Self.replacing(edits, in: data, from: \.replacement, to: \.original),
+              sha256Hex(of: restored) == spec.originalSHA256
+        else { return nil }
+        return restored
+    }
+
+    /// Swaps each edit's `from` bytes for its `to` bytes, or returns nil if any `from` bytes aren't there.
+    private static func replacing(_ edits: [ByteEdit], in data: Data,
+                                  from: KeyPath<ByteEdit, [UInt8]>, to: KeyPath<ByteEdit, [UInt8]>) -> Data? {
+        var result = data
+        for edit in edits {
+            let range = edit.offset ..< edit.offset + edit[keyPath: from].count
+            guard result.count >= range.upperBound, Array(result[range]) == edit[keyPath: from] else { return nil }
+            result.replaceSubrange(range, with: edit[keyPath: to])
+        }
+        return result
     }
 
     /// A backup whose contents match the original file exactly.
@@ -270,69 +373,82 @@ public struct Patcher: Sendable {
 
     // MARK: Applying and undoing
 
-    /// Backs up the original, applies the patch and checks the result.
+    /// Backs up the original, applies the fix (replacing an older fix if there is one) and checks the result.
     /// On any failure the game file is left as it was.
     @discardableResult
     public func apply(to file: URL) throws -> ApplyReport {
-        let original: Data
+        let before: Data
         do {
-            original = try Data(contentsOf: file)
+            before = try Data(contentsOf: file)
         } catch {
             throw PatchError.readFailed(file)
         }
-        switch state(forHash: sha256Hex(of: original)) {
-        case .original: break
+        let replacingOlderFix: Bool
+        switch state(forHash: sha256Hex(of: before)) {
+        case .original: replacingOlderFix = false
+        case .olderFix: replacingOlderFix = true
         case .patched: throw PatchError.alreadyPatched
         case .unsupported(let hash): throw PatchError.unsupportedVersion(sha256: hash)
         }
 
-        let range = spec.offset ..< spec.offset + spec.originalBytes.count
-        guard spec.originalBytes.count == spec.replacementBytes.count,
-              original.count >= range.upperBound,
-              Array(original[range]) == spec.originalBytes
+        guard let original = originalContents(of: before),
+              let patched = Self.replacing(spec.edits, in: original, from: \.original, to: \.replacement)
         else { throw PatchError.unexpectedBytes }
-
-        var patched = original
-        patched.replaceSubrange(range, with: spec.replacementBytes)
         guard sha256Hex(of: patched) == spec.patchedSHA256 else { throw PatchError.patchHashMismatch }
 
         try checkWritable(file)
-        let report: ApplyReport
+        let backup: URL
+        let reused: Bool
         if let existing = existingBackup() {
-            report = ApplyReport(backup: existing, reusedBackup: true)
+            backup = existing
+            reused = true
         } else {
-            report = ApplyReport(backup: try makeBackup(of: original), reusedBackup: false)
+            backup = try makeBackup(of: original)
+            reused = false
         }
 
         try replaceContents(of: file, with: patched)
         if (try? sha256Hex(ofFileAt: file)) != spec.patchedSHA256 {
             do {
-                try replaceContents(of: file, with: original)
+                try replaceContents(of: file, with: before)
             } catch {
-                throw PatchError.verifyFailedNotRestored(backup: report.backup)
+                throw PatchError.verifyFailedNotRestored(backup: backup)
             }
             throw PatchError.verifyFailedRestored
         }
-        return report
+        return ApplyReport(backup: backup, reusedBackup: reused, replacedOlderFix: replacingOlderFix)
     }
 
-    /// Puts the verified backup of the original back. Only works on a patched file,
-    /// so it never overwrites a newer version from a game update.
+    /// Puts the untouched original back. Only works on a file with this fix or an older fix applied,
+    /// so it never overwrites a newer version from a game update. The original is worked out from the
+    /// fixed file itself and checked against its fingerprint; the backup is only needed if that fails.
     public func restore(_ file: URL) throws {
         switch try state(of: file) {
-        case .patched: break
+        case .patched, .olderFix: break
         case .original: throw PatchError.notPatched
         case .unsupported(let hash): throw PatchError.unsupportedVersion(sha256: hash)
         }
-        guard let backup = existingBackup(),
-              let original = try? Data(contentsOf: backup),
-              sha256Hex(of: original) == spec.originalSHA256
-        else { throw PatchError.noBackup }
+        let current: Data
+        do {
+            current = try Data(contentsOf: file)
+        } catch {
+            throw PatchError.readFailed(file)
+        }
+        let original: Data
+        if let rebuilt = originalContents(of: current) {
+            original = rebuilt
+        } else if let backup = existingBackup(), let saved = try? Data(contentsOf: backup),
+                  sha256Hex(of: saved) == spec.originalSHA256 {
+            original = saved
+        } else {
+            throw PatchError.noBackup
+        }
 
         try checkWritable(file)
         try replaceContents(of: file, with: original)
         guard try state(of: file) == .original else {
-            throw PatchError.verifyFailedNotRestored(backup: backup)
+            if (try? replaceContents(of: file, with: current)) != nil { throw PatchError.verifyFailedRestored }
+            throw PatchError.writeFailed(file)
         }
     }
 
